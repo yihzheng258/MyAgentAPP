@@ -1,28 +1,34 @@
 import logging
-from concurrent_log_handler import ConcurrentRotatingFileHandler
-from pydantic import BaseModel, Field
 import time
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
 import uuid
-from langgraph.types import interrupt, Command
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.store.postgres import AsyncPostgresStore
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
-import uvicorn
 from contextlib import asynccontextmanager
-import redis.asyncio as redis
-import json
-from datetime import timedelta, datetime
+from typing import Any, Dict, List, Optional
+
+import uvicorn
+from concurrent_log_handler import ConcurrentRotatingFileHandler
+from fastapi import FastAPI, HTTPException
+from langchain_core.messages.utils import trim_messages
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.prebuilt import create_react_agent
+from langgraph.store.postgres import AsyncPostgresStore
+from langgraph.types import Command
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
+
+from data_models import (
+    ActiveSessionInfoResponse,
+    AgentRequest,
+    AgentResponse,
+    InterruptResponse,
+    LongMemRequest,
+    SessionInfoResponse,
+    SessionStatusResponse,
+    SystemInfoResponse,
+)
+from redis_session_manager import RedisSessionManager
 from utils.config import Config
 from utils.llms import get_llm
 from utils.tools import get_tools
-from redissessionManager import RedisSessionManager
-from data_models import AgentResponse, SystemInfoResponse, AgentRequest, InterruptResponse, SessionStatusResponse, ActiveSessionInfoResponse, SessionInfoResponse, LongMemRequest
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -107,14 +113,7 @@ async def write_long_term_info(user_id :str, memory_info :str):
         logger.error(f"写入用户ID: {user_id} 的长期记忆失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"写入长期记忆失败: {str(e)}")
     
-
-app = FastAPI(
-    title="Agent智能体后端API接口服务",
-    description="基于LangGraph提供AI Agent服务",
-    lifespan=lifespan
-)
-
-
+    
 # 生命周期函数 app应用初始化函数
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -132,10 +131,14 @@ async def lifespan(app: FastAPI):
         logger.info("Chat模型初始化成功")
         
         async with AsyncConnectionPool(
-            dsn=Config.DB_URL,
+            conninfo=Config.DB_URL,
             min_size=Config.MIN_SIZE,
             max_size=Config.MAX_SIZE,
-            row_factory=dict_row
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "row_factory": dict_row
+            }
         ) as pool:
             #初始化短期记忆
             app.state.checkpointer = AsyncPostgresSaver(pool)
@@ -171,9 +174,17 @@ async def lifespan(app: FastAPI):
         await app.state.session_manager.close()
         logger.info("Redis连接已关闭")
         
+        
         # 关闭数据库连接池
         await pool.close()
         logger.info("数据库连接池已关闭")
+
+
+app = FastAPI(
+    title="Agent智能体后端API接口服务",
+    description="基于LangGraph提供AI Agent服务",
+    lifespan=lifespan
+)
     
 async def parse_messages(messages: List[Any]) -> None:
     print("=== 消息解析结果 ===")
@@ -271,6 +282,8 @@ async def process_agent_result(
         last_updated = time.time()
         ttl = Config.TTL
         await app.state.session_manager.update_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+        
+    return response
 
 #API接口：获取全部会话状态信息
 @app.get("/system/info", response_model=SystemInfoResponse)
@@ -316,7 +329,8 @@ async def invoke_agent(request: AgentRequest):
         # 创建会话并存储到redis中
         await app.state.session_manager.create_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
 
-    #因为要提交query，所以status马上变为running
+    # 因为要提交query，所以status马上变为running
+    status = "running"
     last_query = request.query
     last_response = None
     last_updated = time.time()
@@ -390,8 +404,8 @@ async def resume_agent(response: InterruptResponse):
         command_data["args"] = response.args
     
     try:
-        result = await app.state.agent.resume(
-            command=Command(command_data),
+        result = await app.state.agent.ainvoke(
+            Command(resume=command_data),
             config={"configurable": {"thread_id": session_id}}
         )
         
@@ -470,7 +484,7 @@ async def get_agent_active_sessionid(user_id: str):
 async def get_agent_sessionids(user_id: str):
     logger.info(f"调用/agent/sessionids/接口，获取指定用户的所有会话ID，接受到前端用户请求:{user_id}")
     
-    session_ids = await app.state.session_manager.get_all_session_ids(user_id)
+    session_ids = await app.state.session_manager.get_all_users_session_ids(user_id)
     
     if not session_ids:
         logger.error(f"用户 {user_id} 的会话不存在")
@@ -534,7 +548,7 @@ async def write_long_term(request: LongMemRequest):
     
 
 if __name__ == "__main__":
-    uvicorn.run("MyAgentAPP.backendServer:app", host=Config.HOST, port=Config.PORT)
+    uvicorn.run(app, host=Config.HOST, port=Config.PORT)
 
 
 

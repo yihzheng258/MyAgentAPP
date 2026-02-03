@@ -1,27 +1,6 @@
-import logging
-from concurrent_log_handler import ConcurrentRotatingFileHandler
-from pydantic import BaseModel, Field
 import time
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
-import uuid
-from langgraph.types import interrupt, Command
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.store.postgres import AsyncPostgresStore
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
-import uvicorn
-from contextlib import asynccontextmanager
-import redis.asyncio as redis
-import json
-from datetime import timedelta, datetime
-from psycopg_pool import AsyncConnectionPool
-from psycopg.rows import dict_row
-from utils.config import Config
-from utils.llms import get_llm
-from utils.tools import get_tools
-from redissessionManager import RedisSessionManager#定义数据模型
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
 
 # 前端传给后端的请求数据
 class AgentRequest(BaseModel):
@@ -72,7 +51,7 @@ class SessionStatusResponse(BaseModel):
     message: Optional[str] = None
     last_query: Optional[str] = None
     last_updated: Optional[float] = None
-    last_response: Optional[str] = None
+    last_response: Optional[AgentResponse] = None
 
 class LongMemRequest(BaseModel):
     # 用户唯一标识

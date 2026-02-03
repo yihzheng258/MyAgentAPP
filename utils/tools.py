@@ -98,7 +98,7 @@ async def get_tools():
     client = MultiServerMCPClient({
         # 高德地图MCP Server
         "amap-amap-sse": {
-            "url": "https://mcp.amap.com/sse?key=848232bewe1987634de9ew23e19wewed61265e50bb0757",
+            "url": "https://mcp.amap.com/sse?key=81959064675d57b17fd6adfb55819455",
             "transport": "sse",
         }
     })

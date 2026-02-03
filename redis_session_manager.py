@@ -1,26 +1,15 @@
-import logging
-from concurrent_log_handler import ConcurrentRotatingFileHandler
-from pydantic import BaseModel, Field
-import time
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
-import uuid
-from langgraph.types import interrupt, Command
-from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.store.postgres import AsyncPostgresStore
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
-import uvicorn
-from contextlib import asynccontextmanager
-import redis.asyncio as redis
 import json
-from datetime import timedelta, datetime
-from psycopg_pool import AsyncConnectionPool
-from psycopg.rows import dict_row
-from utils.config import Config
-from utils.llms import get_llm
-from utils.tools import get_tools
+import logging
+import uuid
+from datetime import timedelta
+from typing import Dict, List, Optional
+
+import redis.asyncio as redis
+from pydantic import BaseModel
+
+from data_models import AgentResponse
+
+logger = logging.getLogger(__name__)
 
 
 class RedisSessionManager:
@@ -75,9 +64,10 @@ class RedisSessionManager:
                         last_query: Optional[str] = None, last_response: Optional['AgentResponse'] = None,
                         last_updated: Optional[float] = None, ttl: Optional[int] = None) -> bool:
         if await self.redis_client.exists(f"session:{user_id}:{session_id}"):
-            current_data = await self.redis_client.get(f"session:{user_id}:{session_id}")
-            if not current_data:
+            current_data_raw = await self.redis_client.get(f"session:{user_id}:{session_id}")
+            if not current_data_raw:
                 return False
+            current_data = json.loads(current_data_raw)
 
             if status is not None:
                 current_data["status"] = status
@@ -159,7 +149,7 @@ class RedisSessionManager:
         
         return list(session_ids)
     
-    async def get_all_users_session_ids(self) -> Dict[str, List[str]]:
+    async def get_all_session_ids(self) -> Dict[str, List[str]]:
         await self.cleanup_all_sessions()
         result = {}
         

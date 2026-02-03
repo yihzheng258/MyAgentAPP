@@ -24,7 +24,7 @@ logger.addHandler(handler)
 MODEL_CONFIGS = {
     "openai": {
         "base_url": "https://nangeai.top/v1",
-        "api_key": "sk-123",
+        "api_key": "sk-gcHe8rzK6ZMyBmrsTEsNLGmM4XuxuElg8PGVawHIUjLf6ID2",
         "chat_model": "gpt-4o-mini",
         "embedding_model": "text-embedding-3-small"
     }
