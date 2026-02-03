@@ -21,6 +21,8 @@ from psycopg.rows import dict_row
 from utils.config import Config
 from utils.llms import get_llm
 from utils.tools import get_tools
+from redissessionManager import RedisSessionManager
+from data_models import AgentResponse, SystemInfoResponse, AgentRequest, InterruptResponse, SessionStatusResponse, ActiveSessionInfoResponse, SessionInfoResponse, LongMemRequest
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -39,262 +41,78 @@ handler.setFormatter(logging.Formatter(
 logger.addHandler(handler)
 
 
-#定义数据模型
 
-# 前端传给后端的请求数据
-class AgentRequest(BaseModel):
-    session_id: str
-    user_id: str
-    query: str
-    system_message: Optional[str] = "你会使用工具来帮助用户。如果工具使用被拒绝，请提示用户。"
 
-#后端相应数据
-class AgentResponse(BaseModel):
-    session_id: str
-    # interrupted, completed, error
-    status: str
-    timestamp: float = Field(default_factory=lambda: time.time())
-    # error时的提示消息
-    message: Optional[str] = None
-    # completed时的结果消息
-    result: Optional[Dict[str, Any]] = None
-    # interrupted时的中断消息
-    interrupt_data: Optional[Dict[str, Any]] = None
+# 修剪聊天历史以满足 token 数量或消息数量的限制
+def trimmed_messages_hook(state):
+    trimmed_messages = trim_messages(
+        messages=state["messages"],
+        max_tokens=20,
+        strategy="last",
+        token_counter=len,
+        start_on="human",
+        # include_system=True,
+        allow_partial=False
+    )
+    return {"llm_input_messages": trimmed_messages}
 
-#前端给后端的中断恢复请求数据
-class InterruptResponse(BaseModel):
-    user_id: str
-    session_id: str
-    # accept, reject, edit, response
-    response_type: str  
-    # for edit
-    args: Optional[Dict[str, Any]] = None
+# 读取指定用户长期记忆中的内容
+async def read_long_term_info(user_id: str):
     
-class SystemInfoResponse(BaseModel):
-    sessions_count: int
-    active_users: Optional[Dict[str, Any]] = None
-
-class SessionInfoResponse(BaseModel):
-    session_ids: List[str]
-
-class ActiveSessionInfoResponse(BaseModel):
-    # 最近一次更新的会话ID
-    active_session_id: str
-
-class SessionStatusResponse(BaseModel):
-    user_id: str
-    session_id: Optional[str] = None
-    # not_found, idle, running, interrupted, completed, error
-    status: str
-    # error message
-    message: Optional[str] = None
-    last_query: Optional[str] = None
-    last_updated: Optional[float] = None
-    last_response: Optional[str] = None
-
-
-class RedisSessionManager:
-    def __init__(self, redis_host: str, redis_port: int, redis_db: int, session_timeout: int):
-        # 创建 Redis 客户端连接
-        self.redis_client = redis.Redis(
-            host=redis_host,
-            port=redis_port,
-            db=redis_db,
-            decode_responses=True
-        )
-        # 设置默认会话过期时间（秒）
-        self.session_timeout = session_timeout
-
-    # 关闭 Redis 连接
-    async def close(self):
-        await self.redis_client.close()
-    
-    
-    # 创建新会话
-    async def create_session(self, user_id: str, session_id: Optional[str] = None, status: str = "active",
-                            last_query: Optional[str] = None, last_response: Optional['AgentResponse'] = None,
-                            last_updated: Optional[float] = None, ttl: Optional[int] = None) -> str:
-        if not session_id:
-            session_id = str(uuid.uuid4())
+    try:
+        namespace = ("memories", user_id)
         
-        if last_updated is None:
-            last_updated = str(timedelta(seconds=0))
-            
-        effective_ttl = ttl if ttl is not None else self.session_timeout
+        memories = await app.state.store.asearch(namespace, query="")
+
+        if memories is None:
+            raise HTTPException(status_code=500, detail="未找到长期记忆信息")
         
-        session_data = {
-            "session_id": session_id,
-            "status": status,
-            "last_query": last_query,
-            "last_response": last_response.model_dump() if last_response else None,
-            "last_query": last_query,
-            "last_updated": last_updated
+        info = " ".join([d.value["data"] for d in memories]) if memories else "无长期记忆信息"
+        logger.info(f"成功获取用户ID: {user_id} 的长期记忆，内容长度: {len(info)} 字符")
+        
+        return {
+            "sucess": True,
+            "user_id": user_id,
+            "long_term_info": info,
+            "message": "成功获取长期记忆信息" if info else "无长期记忆信息"
         }
+    
+    except Exception as e:
+        logger.error(f"获取用户ID: {user_id} 的长期记忆失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取长期记忆失败: {str(e)}")
+
+# 写入指定用户长期记忆内容
+async def write_long_term_info(user_id :str, memory_info :str):
+    try:
+        namespace = ("memories", user_id)
+        memory_id = str(uuid.uuid4())
         
-        await self.redis_client.set(
-            f"session:{user_id}:{session_id}",
-            json.dumps(session_data),
-            ex=effective_ttl
+        await app.state.store.asave(
+            namespace,
+            memory_id,
+            {
+                "data": memory_info,
+            }
         )
         
-        await self.redis_client.sadd(f"user_sessions:{user_id}", session_id)
+        logger.info(f"成功写入用户ID: {user_id} 的长期记忆，内容长度: {len(memory_info)} 字符")
         
-        return session_id
+        return {
+            "success": True,
+            "memory_id": memory_id,
+            "message": "成功写入长期记忆信息"
+        }
     
-    async def update_session(self, user_id: str, session_id: str, status: Optional[str] = None,
-                        last_query: Optional[str] = None, last_response: Optional['AgentResponse'] = None,
-                        last_updated: Optional[float] = None, ttl: Optional[int] = None) -> bool:
-        if await self.redis_client.exists(f"session:{user_id}:{session_id}"):
-            current_data = await self.redis_client.get(f"session:{user_id}:{session_id}")
-            if not current_data:
-                return False
-
-            if status is not None:
-                current_data["status"] = status
-            if last_response is not None:
-                if isinstance(last_response, BaseModel):
-                    current_data["last_response"] = last_response.model_dump()
-                else:
-                    current_data["last_response"] = last_response
-            if last_query is not None:
-                current_data["last_query"] = last_query
-            if last_updated is not None:
-                current_data["last_updated"] = last_updated       
-                
-            effective_ttl = ttl if ttl is not None else self.session_timeout
-            
-            await self.redis_client.set(
-                f"session:{user_id}:{session_id}",
-                json.dumps(current_data),
-                ex=effective_ttl
-            )
-            return True
-        else:
-            return False
-        
-        
-    async def get_user_active_session_id(self, user_id: str) -> str | None:
-        await self.cleanup_user_sessions(user_id)
-        
-        session_ids = await self.redis_client.smembers(f"user_sessions:{user_id}")
-        
-        latest_session_id = None
-        latest_update_time = -1
-        
-        for session_id in session_ids:
-            session = await self.get_session(user_id, session_id)
-            if not session:
-                continue
-            
-            last_updated = session.get("last_updated", 0)
-            if last_updated and last_updated > latest_update_time:
-                latest_update_time = last_updated
-                latest_session_id = session_id
-                
-        return latest_session_id
+    except Exception as e:
+        logger.error(f"写入用户ID: {user_id} 的长期记忆失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"写入长期记忆失败: {str(e)}")
     
 
-    
-    async def get_session(self, user_id: str, session_id: str) -> Optional[dict]:
-        session_data = await self.redis_client.get(f"session:{user_id}:{session_id}")
-        if not session_data:
-            return None
-    
-        session = json.loads(session_data)
-
-        if session and "last_response" in session:
-            if session["last_response"] is not None:
-                session["last_response"] = AgentResponse(**session["last_response"])
-                
-        return session
-    
-    
-    
-    async def get_session_count(self) -> int:
-        await self.cleanup_all_sessions()
-        count = 0
-        user_keys = await self.redis_client.keys("user_sessions:*")
-        
-        for user_key in user_keys:
-            session_count = await self.redis_client.scard(user_key)
-            count += session_count
-
-        return count
-        
-   
-    async def get_all_users_session_ids(self, user_id: str) -> List[str]:
-        #清理无效对话id
-        await self.cleanup_user_sessions(user_id)
-        session_ids = await self.redis_client.smembers(f"user_sessions:{user_id}")
-        
-        return list(session_ids)
-    
-    async def get_all_users_session_ids(self) -> Dict[str, List[str]]:
-        await self.cleanup_all_sessions()
-        result = {}
-        
-        user_keys = await self.redis_client.keys("user_sessions:*")
-        for user_key in user_keys:
-            user_id = user_key.split(":", 1)[1]
-            session_ids = await self.redis_client.smembers(user_key)
-            result[user_id] = list(session_ids)
-        
-        return result
-    
-    async def get_all_user_sessions(self, user_id: str) -> List[dict]:
-        await self.cleanup_user_sessions(user_id)
-        session_ids = await self.redis_client.smembers(f"user_sessions:{user_id}")
-        
-        sessions = []
-        for session_id in session_ids:
-            session = await self.get_session(user_id, session_id)
-            if session:
-                sessions.append(session)
-        
-        return sessions
-    
-    async def user_id_exists(self, user_id: str) -> bool:
-        await self.cleanup_user_sessions(user_id)
-        user_key = f"user_sessions:{user_id}"
-        return await self.redis_client.exists(user_key) > 0
-    
-    async def session_id_exists(self, user_id: str, session_id: str) -> bool:
-        await self.cleanup_user_sessions(user_id)
-        return (await self.redis_client.exists(f"session:{user_id}:{session_id}")) > 0
-
-
-    
-    async def cleanup_all_sessions(self) -> None:
-        user_keys = await self.redis_client.keys("user_sessions:*")
-        for user_key in user_keys:
-            user_id = user_key.split(":", 1)[1]
-            await self.cleanup_user_sessions(user_id)
-            
-   
-    async def cleanup_user_sessions(self, user_id: str) -> None:
-        session_ids = await self.redis_client.smembers(f"user_sessions:{user_id}")
-
-        for session_id in session_ids:
-            if not await self.redis_client.exists(f"session:{user_id}:{session_id}"):
-                # 如果会话键已过期或不存在，从集合中移除 session_id
-                await self.redis_client.srem(f"user_sessions:{user_id}", session_id)
-                logger.info(f"Removed expired session_id {session_id} for user {user_id}")
-        
-        if not await self.redis_client.scard(f"user_sessions:{user_id}"):
-            await self.redis_client.delete(f"user_sessions:{user_id}")
-            logger.info(f"Deleted empty user_sessions collection for user {user_id}")
-
-    
-    async def delete_session(self, user_id: str, session_id: str) -> bool:
-        await self.redis_client.srem(f"user_sessions:{user_id}", session_id)
-        deleted = await self.redis_client.delete(f"session:{user_id}:{session_id}")
-        return deleted > 0
-        
-
-
-class SystemInfoResponse(BaseModel):
-    session_count: int 
-    active_users: Optional[Dict[str, Any]] = None
+app = FastAPI(
+    title="Agent智能体后端API接口服务",
+    description="基于LangGraph提供AI Agent服务",
+    lifespan=lifespan
+)
 
 
 # 生命周期函数 app应用初始化函数
@@ -313,13 +131,148 @@ async def lifespan(app: FastAPI):
         llm_chat, llm_embedding = get_llm(Config.LLM_TYPE)
         logger.info("Chat模型初始化成功")
         
+        async with AsyncConnectionPool(
+            dsn=Config.DB_URL,
+            min_size=Config.MIN_SIZE,
+            max_size=Config.MAX_SIZE,
+            row_factory=dict_row
+        ) as pool:
+            #初始化短期记忆
+            app.state.checkpointer = AsyncPostgresSaver(pool)
+            await app.state.checkpointer.setup()
+            logger.info("短期记忆初始化成功")
+            
+            #初始化长期记忆
+            app.state.store = AsyncPostgresStore(pool)
+            await app.state.store.setup()
+            logger.info("长期记忆store初始化成功")
+            
+            tools = await get_tools()
+            # 创建ReAct Agent 并存储为单实例
+            app.state.agent = create_react_agent(
+                model=llm_chat,
+                tools=tools,
+                pre_model_hook=trimmed_messages_hook,
+                checkpointer=app.state.checkpointer,
+                store=app.state.store
+            )
+
+            logger.info("Agent初始化成功")
+
+            logger.info("服务完成初始化并启动服务")
+            yield
     
     except Exception as e:
         logger.error(f"应用初始化失败: {e}")
         raise RuntimeError(f"服务初始化失败: {str(e)}")
     
+    finally:
+        # 关闭redis连接
+        await app.state.session_manager.close()
+        logger.info("Redis连接已关闭")
+        
+        # 关闭数据库连接池
+        await pool.close()
+        logger.info("数据库连接池已关闭")
     
+async def parse_messages(messages: List[Any]) -> None:
+    print("=== 消息解析结果 ===")
+    for idx, msg in enumerate(messages, 1):
+        print(f"\n消息 {idx}:")
+        # 获取消息类型
+        msg_type = msg.__class__.__name__
+        print(f"类型: {msg_type}")
+        content = getattr(msg, 'content', '')
+        print(f"内容: {content if content else '<空>'}")
+        # 处理附加信息
+        additional_kwargs = getattr(msg, 'additional_kwargs', {})
+        if additional_kwargs:
+            print("附加信息:")
+            for key, value in additional_kwargs.items():
+                if key == 'tool_calls' and value:
+                    print("  工具调用:")
+                    for tool_call in value:
+                        print(f"    - ID: {tool_call['id']}")
+                        print(f"      函数: {tool_call['function']['name']}")
+                        print(f"      参数: {tool_call['function']['arguments']}")
+                else:
+                    print(f"  {key}: {value}")
+        # 处理 ToolMessage 特有字段
+        if msg_type == 'ToolMessage':
+            tool_name = getattr(msg, 'name', '')
+            tool_call_id = getattr(msg, 'tool_call_id', '')
+            print(f"工具名称: {tool_name}")
+            print(f"工具调用 ID: {tool_call_id}")
+        # 处理 AIMessage 的工具调用和元数据
+        if msg_type == 'AIMessage':
+            tool_calls = getattr(msg, 'tool_calls', [])
+            if tool_calls:
+                print("工具调用:")
+                for tool_call in tool_calls:
+                    print(f"  - 名称: {tool_call['name']}")
+                    print(f"    参数: {tool_call['args']}")
+                    print(f"    ID: {tool_call['id']}")
+            # 提取元数据
+            metadata = getattr(msg, 'response_metadata', {})
+            if metadata:
+                print("元数据:")
+                token_usage = metadata.get('token_usage', {})
+                print(f"  令牌使用: {token_usage}")
+                print(f"  模型名称: {metadata.get('model_name', '未知')}")
+                print(f"  完成原因: {metadata.get('finish_reason', '未知')}")
+        # 打印消息 ID
+        msg_id = getattr(msg, 'id', '未知')
+        print(f"消息 ID: {msg_id}")
+        print("-" * 50)
+ 
+#中断或完成       
+async def process_agent_result(
+        session_id: str,
+        result: Dict[str, Any],
+        user_id: Optional[str] = None
+) -> AgentResponse:
+    response = None
+    
+    try:
+        if "__interrupt__" in result:
+            interrupt_data = result["__interrupt__"][0].value
+            # 确保中断数据有类型信息
+            if "interrupt_type" not in interrupt_data:
+                interrupt_data["interrupt_type"] = "unknown"
+            # 返回中断信息
+            response = AgentResponse(
+                session_id=session_id,
+                status="interrupted",
+                interrupt_data=interrupt_data
+            )
+            logger.info(f"当前触发工具调用中断:{response}")
+        else:
+            response = AgentResponse(
+                session_id=session_id,
+                status="completed",
+                result=result
+            )
+            logger.info(f"最终智能体回复结果:{response}")
+    
+    except Exception as e:
+        response = AgentResponse(
+            session_id=session_id,
+            status="error",
+            message=f"处理智能体结果时出错: {str(e)}"
+        )
+        logger.error(f"处理智能体结果时出错:{response}")
 
+    exists = await app.state.session_manager.session_id_exists(user_id, session_id)
+    if exists:
+        # 更新会话状态
+        status = response.status
+        last_query = None
+        last_response = response
+        last_updated = time.time()
+        ttl = Config.TTL
+        await app.state.session_manager.update_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+
+#API接口：获取全部会话状态信息
 @app.get("/system/info", response_model=SystemInfoResponse)
 async def get_system_info():
     logger.info(f"调用/system/info接口，获取当前系统内全部的会话状态信息")
@@ -330,6 +283,258 @@ async def get_system_info():
     )
     logger.info(f"返回当前系统状态信息:{response}")
     return response
+
+
+@app.post("/agent/invoke", response_model=AgentResponse)
+async def invoke_agent(request: AgentRequest):
+    logger.info(f"调用/agent/invoke接口，用户ID:{request.user_id}，会话ID:{request.session_id}，查询内容:{request.query}")
+
+    user_id = request.user_id
+    session_id = request.session_id
+    
+    long_term_info = await read_long_term_info(user_id)
+    
+    if long_term_info.get("success", False):
+        info = long_term_info.get("long_term_info")
+        if info:
+            system_message = f"{request.system_message}我的附加信息有:{long_term_info}"
+            logger.info(f"获取用户偏好配置数据，system_message的信息为:{system_message}")
+        else:
+            system_message = request.system_message
+            logger.info(f"无用户偏好配置信息，system_message的信息为:{system_message}")
+    else:
+        system_message = request.system_message
+        logger.info(f"获取用户偏好配置数据失败，system_message的信息为:{system_message}")        
+
+    exists = await app.state.session_manager.session_id_exists(user_id, session_id)
+    if not exists:
+        status = "idle"
+        last_query = None
+        last_response = None
+        last_updated = time.time()
+        ttl = Config.TTL
+        # 创建会话并存储到redis中
+        await app.state.session_manager.create_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+
+    #因为要提交query，所以status马上变为running
+    last_query = request.query
+    last_response = None
+    last_updated = time.time()
+    ttl = Config.TTL
+    await app.state.session_manager.update_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+
+    # 构造智能体输入消息体
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": request.query}
+    ]
+    
+    try: 
+        result = await app.state.agent.ainvoke({"messages": messages}, config={"configurable": {"thread_id": session_id}})
+        
+        await parse_messages(result['messages'])
+        
+        return await process_agent_result(session_id, result, user_id)
+        
+    except Exception as e:
+        # 异常处理
+        error_response = AgentResponse(
+            session_id=session_id,
+            status="error",
+            message=f"处理请求时出错: {str(e)}"
+        )
+        logger.error(f"处理请求时出错: {error_response}")
+
+        # 更新会话状态
+        status = "error"
+        last_query = None
+        last_response = error_response
+        last_updated = time.time()
+        ttl = Config.TTL
+        await app.state.session_manager.update_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+
+        return error_response
+
+@app.post("/agent/resume", response_model=AgentResponse)
+async def resume_agent(response: InterruptResponse):
+    logger.info(f"调用/agent/resume接口，恢复被中断的智能体运行并等待运行完成或再次中断，接受到前端用户请求:{response}")
+
+    user_id = response.user_id
+    session_id = response.session_id
+    
+    #判断当前会话是否存在
+    exists = await app.state.session_manager.session_id_exists(user_id, session_id)
+    if not exists:
+        logger.error(f"status_code=404,用户会话 {user_id}:{session_id} 不存在")
+        raise HTTPException(status_code=404, detail=f"用户会话 {user_id}:{session_id} 不存在")
+
+    #如果会话状态不是interrupt，则抛出异常
+    session = await app.state.session_manager.get_session(user_id, session_id)
+    status = session.get("status")
+    if status != "interrupted":
+        logger.error(f"status_code=400,会话当前状态为 {status}，无法恢复非中断状态的会话")
+        raise HTTPException(status_code=400, detail=f"会话当前状态为 {status}，无法恢复非中断状态的会话")
+
+    # 更新会话状态
+    status = "running"
+    last_query = None
+    last_response = None
+    last_updated = time.time()
+    ttl = Config.TTL
+    await app.state.session_manager.update_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+
+    command_data = {
+        "type": response.response_type
+    }
+    if response.response_type == "edit" and response.args:
+        command_data["args"] = response.args
+    
+    try:
+        result = await app.state.agent.resume(
+            command=Command(command_data),
+            config={"configurable": {"thread_id": session_id}}
+        )
+        
+        await parse_messages(result['messages'])
+        
+        return await process_agent_result(session_id, result, user_id)
+
+    except Exception as e:
+        # 异常处理
+        error_response = AgentResponse(
+            session_id=session_id,
+            status="error",
+            message=f"处理请求时出错: {str(e)}"
+        )
+        logger.error(f"处理请求时出错: {error_response}")
+
+        # 更新会话状态
+        status = "error"
+        last_query = None
+        last_response = error_response
+        last_updated = time.time()
+        ttl = Config.TTL
+        await app.state.session_manager.update_session(user_id, session_id, status, last_query, last_response, last_updated, ttl)
+
+        return error_response
+
+# API接口:获取指定用户当前会话的状态数据
+@app.get("/agent/status/{user_id}/{session_id}", response_model=SessionStatusResponse)
+async def get_agent_session_status(user_id: str, session_id: str):
+    logger.info(f"调用/agent/status/接口，获取指定用户当前会话的状态数据，接受到前端用户请求:{user_id}:{session_id}")
+    
+    exists = await app.state.session_manager.session_id_exists(user_id, session_id)
+    
+    if not exists:
+        logger.error(f"status_code=404,用户会话 {user_id}:{session_id} 不存在")
+        return SessionStatusResponse(
+            user_id=user_id,
+            session_id=session_id,
+            status="not_found",
+            message=f"用户 {user_id}:{session_id} 的会话不存在"
+        )
+    
+    #若会话存在
+    session = await app.state.session_manager.get_session(user_id, session_id)
+    response = SessionStatusResponse(
+        user_id=user_id,
+        session_id=session_id,
+        status=session.get("status"),
+        last_query=session.get("last_query"),
+        last_updated=session.get("last_updated"),
+        last_response=session.get("last_response")
+    )
+    logger.info(f"返回当前用户的会话状态:{response}")
+    return response
+
+# API接口:获取指定用户当前最近一次更新的会话ID
+@app.get("/agent/active/sessionid/{user_id}", response_model=ActiveSessionInfoResponse)
+async def get_agent_active_sessionid(user_id: str):
+    logger.info(f"调用/agent/active/sessionid/接口，获取指定用户当前最近一次更新的会话ID，接受到前端用户请求:{user_id}")
+    
+    active_session_id = await app.state.session_manager.get_user_active_session_id(user_id)
+    
+    if not active_session_id:
+        logger.error(f"用户 {user_id} 的会话不存在")
+        return ActiveSessionInfoResponse(
+            active_session_id=""
+        )    
+    response = ActiveSessionInfoResponse(
+        active_session_id=active_session_id
+    )
+    logger.info(f"返回当前用户的最近一次更新的会话ID:{response}")
+    return response
+
+#API接口:获取指定用户的所有会话id
+@app.get("/agent/sessionids/{user_id}", response_model=SessionInfoResponse)
+async def get_agent_sessionids(user_id: str):
+    logger.info(f"调用/agent/sessionids/接口，获取指定用户的所有会话ID，接受到前端用户请求:{user_id}")
+    
+    session_ids = await app.state.session_manager.get_all_session_ids(user_id)
+    
+    if not session_ids:
+        logger.error(f"用户 {user_id} 的会话不存在")
+        return SessionInfoResponse(
+            session_ids=[]
+        )    
+    response = SessionInfoResponse(
+        session_ids=session_ids
+    )
+    logger.info(f"返回当前用户的所有会话ID:{response}")
+    return response
+    
+
+# API接口:删除指定用户当前会话
+@app.delete("/agent/session/{user_id}/{session_id}")
+async def delete_agent_session(user_id: str, session_id: str):
+    logger.info(f"调用/agent/session/接口，删除指定用户当前会话，接受到前端用户请求:{user_id}:{session_id}")
+    
+    exists = await app.state.session_manager.session_id_exists(user_id, session_id)
+    
+    if not exists:
+        logger.error(f"status_code=404,用户会话 {user_id}:{session_id} 不存在")
+        raise HTTPException(status_code=404, detail=f"用户会话 {user_id}:{session_id} 不存在")
+    
+    #若会话存在，删除会话
+    await app.state.session_manager.delete_session(user_id, session_id)
+    
+    logger.info(f"成功删除用户会话 {user_id}:{session_id}")
+    return {"message": f"成功删除用户会话 {user_id}:{session_id}"}
+
+# API接口:写入指定用户的长期记忆
+@app.post("/agent/write/longterm")
+async def write_long_term(request: LongMemRequest):
+    logger.info(f"调用/agent/write/longterm接口，写入指定用户的长期记忆，接受到前端用户请求:{request}")
+    
+    user_id = request.user_id
+    memory_info = request.memory_info
+    
+    exists = await app.state.session_manager.user_id_exists(user_id)
+    # 如果不存在 则抛出异常
+    if not exists:
+        logger.error(f"status_code=404,用户 {user_id} 不存在")
+        raise HTTPException(status_code=404, detail=f"用户会话 {user_id} 不存在")
+
+    result = await write_long_term_info(user_id, memory_info)
+
+        # 检查返回结果是否成功
+    if result.get("success", False):
+        # 构造成功响应
+        return {
+            "status": "success",
+            "memory_id": result.get("memory_id"),
+            "message": result.get("message", "记忆存储成功")
+        }
+    else:
+        # 处理非成功返回结果
+        raise HTTPException(
+            status_code=500,
+            detail="记忆存储失败，返回结果未包含成功状态"
+        )
+    
+
+if __name__ == "__main__":
+    uvicorn.run("MyAgentAPP.backendServer:app", host=Config.HOST, port=Config.PORT)
 
 
 

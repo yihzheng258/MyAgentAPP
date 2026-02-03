@@ -50,6 +50,12 @@ def main():
             console.print(f"[info]系统内全部用户及用户会话: {system_info['active_users']}[/info]")
     except Exception:
         console.print("[warning]无法获取当前系统内会话状态信息[/warning]")
+        
+    #输入用户ID，没有就用默认值
+    default_user_id = f"user_{int(time.time())}"
+    user_id = Prompt.ask("[info]请输入用户ID[/info] (新ID将创建新用户，已有ID将恢复使用该用户)", default=default_user_id)
+
+    
 
 if __name__ == "__main__":
     main()
