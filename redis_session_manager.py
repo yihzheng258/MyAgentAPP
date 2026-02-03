@@ -142,14 +142,14 @@ class RedisSessionManager:
         return count
         
    
-    async def get_all_users_session_ids(self, user_id: str) -> List[str]:
+    async def get_all_session_ids(self, user_id: str) -> List[str]:
         #清理无效对话id
         await self.cleanup_user_sessions(user_id)
         session_ids = await self.redis_client.smembers(f"user_sessions:{user_id}")
         
         return list(session_ids)
     
-    async def get_all_session_ids(self) -> Dict[str, List[str]]:
+    async def get_all_users_session_ids(self) -> Dict[str, List[str]]:
         await self.cleanup_all_sessions()
         result = {}
         

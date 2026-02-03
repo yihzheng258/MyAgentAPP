@@ -271,6 +271,12 @@ def display_session_info(status_response):
             ))
 
 def write_long_term(user_id: str, memory_info: str):
+    payload = {
+        "user_id": user_id,
+        "memory_info": memory_info
+    }
+
+    console.print("[info]正在发送请求写入指定用户长期记忆内容，请稍候...[/info]")
     with Progress() as progress:
         task = progress.add_task("[cyan]写入长期记忆处理中...", total=None)
         response = requests.post(f"{API_BASE_URL}/agent/write/longterm", json=payload)
@@ -484,7 +490,21 @@ def main():
         try:
             #处理中断
             if has_active_session and session_status:
-                pass
+                 if session_status["status"] == "interrupted":
+                    console.print("[info]自动处理中断的会话...[/info]")
+                    if "last_response" in session_status and session_status["last_response"]:
+                        process_agent_response(session_status["last_response"], user_id)
+                        current_status = get_agent_status(user_id, session_id)
+
+                        if current_status["status"] == "completed":
+                            # 显示完成消息
+                            console.print("[success]本次查询已完成[/success]")
+                            console.print("[info]自动开始新的查询...[/info]")
+                            has_active_session = False
+                            session_status = None
+                        else:
+                            has_active_session = True
+                            session_status = current_status
             
             query = Prompt.ask("\n[info]Ask me anything![/info](输入 'exit' 退出，输入 'status' 查询状态，输入 'new' 开始新会话，输入 'history' 恢复历史会话，输入 'setting' 偏好设置)")
             

@@ -77,7 +77,7 @@ async def read_long_term_info(user_id: str):
         logger.info(f"成功获取用户ID: {user_id} 的长期记忆，内容长度: {len(info)} 字符")
         
         return {
-            "sucess": True,
+            "success": True,
             "user_id": user_id,
             "long_term_info": info,
             "message": "成功获取长期记忆信息" if info else "无长期记忆信息"
@@ -93,10 +93,10 @@ async def write_long_term_info(user_id :str, memory_info :str):
         namespace = ("memories", user_id)
         memory_id = str(uuid.uuid4())
         
-        await app.state.store.asave(
-            namespace,
-            memory_id,
-            {
+        await app.state.store.aput(
+            namespace=namespace,
+            key=memory_id,
+            value={
                 "data": memory_info,
             }
         )
@@ -310,7 +310,7 @@ async def invoke_agent(request: AgentRequest):
     if long_term_info.get("success", False):
         info = long_term_info.get("long_term_info")
         if info:
-            system_message = f"{request.system_message}我的附加信息有:{long_term_info}"
+            system_message = f"{request.system_message}我的附加信息有:{info}"
             logger.info(f"获取用户偏好配置数据，system_message的信息为:{system_message}")
         else:
             system_message = request.system_message
@@ -400,7 +400,8 @@ async def resume_agent(response: InterruptResponse):
     command_data = {
         "type": response.response_type
     }
-    if response.response_type == "edit" and response.args:
+    
+    if response.args:
         command_data["args"] = response.args
     
     try:
@@ -484,7 +485,7 @@ async def get_agent_active_sessionid(user_id: str):
 async def get_agent_sessionids(user_id: str):
     logger.info(f"调用/agent/sessionids/接口，获取指定用户的所有会话ID，接受到前端用户请求:{user_id}")
     
-    session_ids = await app.state.session_manager.get_all_users_session_ids(user_id)
+    session_ids = await app.state.session_manager.get_all_session_ids(user_id)
     
     if not session_ids:
         logger.error(f"用户 {user_id} 的会话不存在")
