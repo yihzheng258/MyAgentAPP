@@ -2,20 +2,25 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 import uvicorn
 from concurrent_log_handler import ConcurrentRotatingFileHandler
 from fastapi import FastAPI, HTTPException
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.messages.utils import trim_messages
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph.message import add_messages
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
 from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.types import Command
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
+from typing_extensions import TypedDict
 
-from data_models import (
+from MyMultiAgentAPP.utils.data_models import (
     ActiveSessionInfoResponse,
     AgentRequest,
     AgentResponse,
@@ -25,7 +30,7 @@ from data_models import (
     SessionStatusResponse,
     SystemInfoResponse,
 )
-from redis_session_manager import RedisSessionManager
+from MyMultiAgentAPP.utils.redis_session_manager import RedisSessionManager
 from utils.config import Config
 from utils.llms import get_llm
 from utils.tools import get_tools
@@ -46,21 +51,120 @@ handler.setFormatter(logging.Formatter(
 ))
 logger.addHandler(handler)
 
+TRAVEL_PLAN_KEYWORDS = (
+    "旅游",
+    "旅行",
+    "行程",
+    "攻略",
+    "景点",
+    "路线",
+    "出行",
+    "travel",
+    "itinerary",
+)
 
 
+class MultiAgentState(TypedDict, total=False):
+    messages: Annotated[List[AnyMessage], add_messages]
+    user_query: str
 
-# 修剪聊天历史以满足 token 数量或消息数量的限制
-def trimmed_messages_hook(state):
-    trimmed_messages = trim_messages(
-        messages=state["messages"],
+
+def should_generate_travel_plan(user_query: Optional[str]) -> bool:
+    if not user_query:
+        return False
+    normalized_query = user_query.lower()
+    return any(keyword in normalized_query for keyword in TRAVEL_PLAN_KEYWORDS)
+
+
+def build_writer_context(messages: List[AnyMessage]) -> tuple[str, str]:
+    core_answer = ""
+    tool_notes: List[str] = []
+
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            tool_name = getattr(message, "name", "tool")
+            tool_content = getattr(message, "content", "")
+            if tool_content:
+                tool_notes.append(f"[{tool_name}] {tool_content}")
+
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            content = getattr(message, "content", "")
+            if isinstance(content, str) and content.strip():
+                core_answer = content
+                break
+
+    return core_answer, "\n".join(tool_notes)
+
+
+def trim_history_messages(messages: List[AnyMessage]) -> List[AnyMessage]:
+    return trim_messages(
+        messages=messages,
         max_tokens=20,
         strategy="last",
         token_counter=len,
         start_on="human",
-        # include_system=True,
-        allow_partial=False
+        allow_partial=False,
     )
-    return {"llm_input_messages": trimmed_messages}
+
+
+async def researcher_llm_node(state: MultiAgentState, config: RunnableConfig) -> Dict[str, Any]:
+    llm_with_tools = app.state.query_llm.bind_tools(app.state.tools)
+    messages = state.get("messages", [])
+    llm_input_messages = trim_history_messages(messages)
+    ai_msg = await llm_with_tools.ainvoke(llm_input_messages, config=config)
+    return {"messages": [ai_msg]}
+
+
+def researcher_router(state: MultiAgentState) -> str:
+    messages = state.get("messages", [])
+    if not messages:
+        return END
+    last_message = messages[-1]
+    if isinstance(last_message, AIMessage) and getattr(last_message, "tool_calls", None):
+        return "research_tools"
+    if should_generate_travel_plan(state.get("user_query")):
+        return "writer_agent"
+    return END
+
+
+async def writer_agent_node(state: MultiAgentState, config: RunnableConfig) -> Dict[str, Any]:
+    core_answer, tool_notes = build_writer_context(state.get("messages", []))
+    writer_prompt = [
+        SystemMessage(
+            content=(
+                "你是Writer Agent，请基于查询Agent和工具检索信息生成旅游计划。"
+                "输出应包含：每日行程、交通建议、预算建议、注意事项。"
+                "如果信息不足，请明确缺口并给出补充建议。"
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"用户需求：{state.get('user_query', '')}\n\n"
+                f"查询Agent结论：{core_answer or '无'}\n\n"
+                f"工具检索信息：\n{tool_notes or '无'}\n\n"
+                "请输出一份可执行的中文旅游计划。"
+            )
+        ),
+    ]
+    writer_reply = await app.state.writer_llm.ainvoke(writer_prompt, config=config)
+    return {"messages": [AIMessage(content=writer_reply.content, name="WriterAgent")]}
+
+
+def build_multi_agent_graph(checkpointer: AsyncPostgresSaver):
+    graph_builder = StateGraph(MultiAgentState)
+    graph_builder.add_node("researcher_llm", researcher_llm_node)
+    graph_builder.add_node("research_tools", ToolNode(app.state.tools))
+    graph_builder.add_node("writer_agent", writer_agent_node)
+    graph_builder.add_edge(START, "researcher_llm")
+    graph_builder.add_conditional_edges(
+        "researcher_llm",
+        researcher_router,
+        {"research_tools": "research_tools", "writer_agent": "writer_agent", END: END},
+    )
+    graph_builder.add_edge("research_tools", "researcher_llm")
+    graph_builder.add_edge("writer_agent", END)
+    return graph_builder.compile(checkpointer=checkpointer)
 
 # 读取指定用户长期记忆中的内容
 async def read_long_term_info(user_id: str):
@@ -117,6 +221,7 @@ async def write_long_term_info(user_id :str, memory_info :str):
 # 生命周期函数 app应用初始化函数
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    pool = None
     try:
         #初始化redis会话管理器
         app.state.session_manager = RedisSessionManager(
@@ -133,7 +238,7 @@ async def lifespan(app: FastAPI):
         async with AsyncConnectionPool(
             conninfo=Config.DB_URL,
             min_size=Config.MIN_SIZE,
-            max_size=Config.MAX_SIZE,
+            max_size=Config.MAX_SIZE, 
             kwargs={
                 "autocommit": True,
                 "prepare_threshold": 0,
@@ -151,16 +256,12 @@ async def lifespan(app: FastAPI):
             logger.info("长期记忆store初始化成功")
             
             tools = await get_tools()
-            # 创建ReAct Agent 并存储为单实例
-            app.state.agent = create_react_agent(
-                model=llm_chat,
-                tools=tools,
-                pre_model_hook=trimmed_messages_hook,
-                checkpointer=app.state.checkpointer,
-                store=app.state.store
-            )
+            app.state.tools = tools
+            app.state.query_llm = llm_chat
+            app.state.writer_llm = llm_chat
+            app.state.agent = build_multi_agent_graph(app.state.checkpointer)
 
-            logger.info("Agent初始化成功")
+            logger.info("MultiAgent初始化成功")
 
             logger.info("服务完成初始化并启动服务")
             yield
@@ -171,13 +272,15 @@ async def lifespan(app: FastAPI):
     
     finally:
         # 关闭redis连接
-        await app.state.session_manager.close()
-        logger.info("Redis连接已关闭")
+        if hasattr(app.state, "session_manager"):
+            await app.state.session_manager.close()
+            logger.info("Redis连接已关闭")
         
         
         # 关闭数据库连接池
-        await pool.close()
-        logger.info("数据库连接池已关闭")
+        if pool is not None:
+            await pool.close()
+            logger.info("数据库连接池已关闭")
 
 
 app = FastAPI(
@@ -339,14 +442,16 @@ async def invoke_agent(request: AgentRequest):
 
     # 构造智能体输入消息体
     messages = [
-        {"role": "system", "content": system_message},
-        {"role": "user", "content": request.query}
+        SystemMessage(content=system_message),
+        HumanMessage(content=request.query),
     ]
     
     try: 
-        result = await app.state.agent.ainvoke({"messages": messages}, config={"configurable": {"thread_id": session_id}})
-        
-        await parse_messages(result['messages'])
+        result = await app.state.agent.ainvoke(
+            {"messages": messages, "user_query": request.query},
+            config={"configurable": {"thread_id": session_id}},
+        )
+        await parse_messages(result.get("messages", []))
         
         return await process_agent_result(session_id, result, user_id)
         
@@ -409,8 +514,7 @@ async def resume_agent(response: InterruptResponse):
             Command(resume=command_data),
             config={"configurable": {"thread_id": session_id}}
         )
-        
-        await parse_messages(result['messages'])
+        await parse_messages(result.get("messages", []))
         
         return await process_agent_result(session_id, result, user_id)
 
